@@ -10,9 +10,9 @@ find_path(
 	)
 
 if (NOT HSART_LIBRARIES)
-	message(SEND_ERROR "HSA Runtime not found")
+	message(WARNING "HSA Runtime not found")
 elseif(NOT HSART_INCLUDE_DIR)
-	message(SEND_ERROR "HSA Includes not found")
+	message(WARNING "HSA Includes not found")
 else()
 	message(STATUS "Using HSA Runtime at ${HSART_LIBRARIES}")
 	message(STATUS "Using HSA Includes at ${HSART_INCLUDE_DIR}")
@@ -20,8 +20,8 @@ else()
 	set(LLVM_LINK_COMPONENTS
 	  HSAIL
 	  X86
-	  MCJIT
 	  IRReader
+	  Linker
 	  )
 
 	add_llvm_tool(hsailc
