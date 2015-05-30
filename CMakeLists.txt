@@ -1,14 +1,3 @@
-set(LLVM_LINK_COMPONENTS
-  HSAIL
-  X86
-  MCJIT
-  IRReader
-  )
-
-add_llvm_tool(hsailc
-  hsailc.cpp
-  )
-
 
 find_library(
 	HSART_LIBRARIES
@@ -26,13 +15,19 @@ elseif(NOT HSART_INCLUDE_DIR)
 	message(SEND_ERROR "HSA Includes not found")
 else()
 	message(STATUS "Using HSA Runtime at ${HSART_LIBRARIES}")
-	message(STATUS "Using HSA Includes at ${HSART_INCLUDES}")
+	message(STATUS "Using HSA Includes at ${HSART_INCLUDE_DIR}")
+
+	set(LLVM_LINK_COMPONENTS
+	  HSAIL
+	  X86
+	  MCJIT
+	  IRReader
+	  )
+
+	add_llvm_tool(hsailc
+	  hsailc.cpp
+	  )
+
+	target_include_directories(hsailc PUBLIC ${HSART_INCLUDE_DIR})
+	target_link_libraries(hsailc ${HSART_LIBRARIES})
 endif()
-
-target_include_directories(hsailc PUBLIC ${HSART_INCLUDE_DIR})
-get_target_property(TMP hsailc INCLUDE_DIRECTORIES)
-foreach(dir ${TMP})
-	message(STATUS "Include Dir: ${dir}")
-endforeach()
-target_link_libraries(hsailc ${HSART_LIBRARIES})
-
