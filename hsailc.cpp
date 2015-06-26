@@ -26,6 +26,8 @@
 #include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
+#include "llvm/Transforms/IPO.h"
+#include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #include <memory>
 
 // Link
@@ -38,6 +40,81 @@
 #include "hsa_ext_finalize.h"
 
 using namespace llvm;
+
+// Returns the TargetMachine instance or zero if no triple is provided.
+static TargetMachine* GetTargetMachine(Triple TheTriple) {
+  std::string Error;
+  auto MArch = "hsail64";
+
+  const Target *TheTarget = TargetRegistry::lookupTarget(MArch, TheTriple,
+                                                         Error);
+  // Some modules don't specify a triple, and this is okay.
+  if (!TheTarget) {
+	  errs() << "Target Not Found \n";
+    return nullptr;
+  }
+
+  // Package up features to be passed to target/subtarget
+  std::string FeaturesStr;
+  std::string MCPU;
+
+
+  return TheTarget->createTargetMachine(TheTriple.getTriple(),
+                                        MCPU, FeaturesStr,
+                                        TargetOptions(),
+                                        Reloc::Default, CodeModel::Default,
+                                        CodeGenOpt::Aggressive);
+}
+static inline void addPass(PassManagerBase &PM, Pass *P) {
+  // Add the pass to the pass manager...
+  PM.add(P);
+
+  // If we are verifying all of the intermediate steps, add the verifier...
+  if (false) {
+    PM.add(createVerifierPass());
+    PM.add(createDebugInfoVerifierPass());
+  }
+}
+
+/// This routine adds optimization passes based on selected optimization level,
+/// OptLevel.
+///
+/// OptLevel - Optimization Level
+static void AddOptimizationPasses(PassManagerBase &MPM,FunctionPassManager &FPM,
+                                  unsigned OptLevel, unsigned SizeLevel) {
+  FPM.add(createVerifierPass());          // Verify that input is correct
+  MPM.add(createDebugInfoVerifierPass()); // Verify that debug info is correct
+
+  PassManagerBuilder Builder;
+  Builder.OptLevel = OptLevel;
+  Builder.SizeLevel = SizeLevel;
+
+//  if (DisableInline) {
+//    // No inlining pass
+//  } else if (OptLevel > 1) {
+    Builder.Inliner = createFunctionInliningPass(OptLevel, SizeLevel);
+//  } else {
+//    Builder.Inliner = createAlwaysInlinerPass();
+//  }
+  //Builder.DisableUnitAtATime = !UnitAtATime;
+  //Builder.DisableUnrollLoops = (DisableLoopUnrolling.getNumOccurrences() > 0) ?
+  //                             DisableLoopUnrolling : OptLevel == 0;
+
+  // When #pragma vectorize is on for SLP, do the same as above
+  Builder.SLPVectorize = true;
+      //DisableSLPVectorization ? false : OptLevel > 1 && SizeLevel < 2;
+
+  Builder.populateFunctionPassManager(FPM);
+  Builder.populateModulePassManager(MPM);
+}
+
+static void AddStandardLinkPasses(PassManagerBase &PM) {
+  PassManagerBuilder Builder;
+  Builder.VerifyInput = true;
+
+	Builder.Inliner = createFunctionInliningPass();
+  Builder.populateLTOPassManager(PM);
+}
 
 static void diagnosticHandler(const DiagnosticInfo &DI) {
   unsigned Severity = DI.getSeverity();
@@ -68,17 +145,17 @@ int main(int argc, char** argv) {
 	llvm_shutdown_obj X;
 
 	// Initialization
-	InitializeAllTargets();
-	InitializeAllTargetMCs();
-	InitializeAllAsmParsers();
-	InitializeAllAsmPrinters();
-
-	PassRegistry* Registry = PassRegistry::getPassRegistry();
-	initializeCore(*Registry);
-	initializeCodeGen(*Registry);
-	initializeLoopStrengthReducePass(*Registry);
-	initializeLowerIntrinsicsPass(*Registry);
-	initializeUnreachableBlockElimPass(*Registry);
+//	InitializeAllTargets();
+//	InitializeAllTargetMCs();
+//	InitializeAllAsmParsers();
+//	InitializeAllAsmPrinters();
+//
+//	PassRegistry* Registry = PassRegistry::getPassRegistry();
+//	initializeCore(*Registry);
+//	initializeCodeGen(*Registry);
+//	initializeLoopStrengthReducePass(*Registry);
+//	initializeLowerIntrinsicsPass(*Registry);
+//	initializeUnreachableBlockElimPass(*Registry);
 
 	std::string HSATargetTriple("hsail64-unknown-unknown");
 
@@ -87,6 +164,20 @@ int main(int argc, char** argv) {
 	std::unique_ptr<Module> Builtins;
 	std::unique_ptr<Module> M;
 	Triple TheTriple;
+	std::error_code EC;
+    std::unique_ptr<tool_output_file> Out;
+
+    // ${CLC_PATH}/clc2 -cl-std=CL2.0 -o ${FILE}-spir.bc ${FILE}.cl
+	// -> input file
+
+	// Load input file (SPIR Bitcode)
+	M = parseIRFile(FILE_PATH, Err, Context);
+	if (!M) {
+		Err.print(argv[0], errs());
+		return 1;
+	}
+
+    // ${LLVM_PATH}/llvm-link -o ${FILE}-lnk.bc ${FILE}-spir.bc ${BUILTINS_PATH}
 
 	// Load builtins
 	Builtins = parseIRFile(BUILTINS_PATH, Err, Context);
@@ -96,76 +187,201 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-	// Load input file (SPIR Bitcode)
-	M = parseIRFile(FILE_PATH, Err, Context);
-	if (!M) {
-		Err.print(argv[0], errs());
-		return 1;
-	}
 
 	// Replace SPIR Target with HSAIL
-	M->setTargetTriple(Triple::normalize(HSATargetTriple));
-	TheTriple = Triple(M->getTargetTriple());
+	//M->setTargetTriple(Triple::normalize(HSATargetTriple));
+	//TheTriple = Triple(M->getTargetTriple());
+	//Builtins->setTargetTriple(TheTriple.getTriple());
+
+	//////// OUTPUT builtins
+    Out.reset(new tool_output_file("vector_copy-builtins.ll", EC, sys::fs::F_None));
+    if (EC) {
+      errs() << EC.message() << '\n';
+      return 1;
+    }
+	Builtins->print(Out->os(), nullptr);
+	Out->keep();
+
+	//////// OUTPUT PRE-LINK
+    Out.reset(new tool_output_file("vector_copy-spir.ll", EC, sys::fs::F_None));
+    if (EC) {
+      errs() << EC.message() << '\n';
+      return 1;
+    }
+	M->print(Out->os(), nullptr);
+	Out->keep();
 
 	// Link in the builtins
 	auto Composite = make_unique<Module>("llvm-link", Context);
+	Composite->setDataLayout(M->getDataLayout());
 	Linker L(Composite.get(), diagnosticHandler);
 
-    if (L.linkInModule(Builtins.get()))
+    if (L.linkInModule(M.release()))
       return 1;
 
-    if (L.linkInModule(M.get()))
+    if (L.linkInModule(Builtins.release()))
       return 1;
+
 
 	if (verifyModule(*Composite)) {
 		errs() << argv[0] << ": linked module is broken!\n";
 		return 1;
 	}
 
-	// Get the target specific parser.
-	std::string Error;
-	const Target *TheTarget = TargetRegistry::lookupTarget(MArch, TheTriple,
-			Error);
-	if (!TheTarget) {
-		errs() << argv[0] << ": " << Error;
-		return 1;
-	}
+	M = std::move(Composite);
 
-	CodeGenOpt::Level OLvl = CodeGenOpt::Default; // O2
-	TargetOptions Options; // Defaults
+	//////// OUTPUT POST-LINK
+    Out.reset(new tool_output_file("vector_copy-link.ll", EC, sys::fs::F_None));
+    if (EC) {
+      errs() << EC.message() << '\n';
+      return 1;
+    }
+	M->print(Out->os(), nullptr);
+	Out->keep();
+    // ${LLVM_PATH}/opt -O3 -o ${FILE}-opt.bc ${FILE}-lnk.bc
 
-	std::unique_ptr<TargetMachine> Target(
-			TheTarget->createTargetMachine(TheTriple.getTriple(), MCPU, "",
-				Options, RelocModel, CMModel, OLvl));
-	assert(Target && "Could not allocate target machine!");
 
-	PassManager PM;
+  InitializeAllTargets();
+  InitializeAllTargetMCs();
+  InitializeAllAsmPrinters();
 
-	// Add an appropriate TargetLibraryInfo pass for the module's triple.
-	TargetLibraryInfo *TLI = new TargetLibraryInfo(TheTriple);
-	PM.add(TLI);
+  // Initialize passes
+  PassRegistry &Registry = *PassRegistry::getPassRegistry();
+  initializeCore(Registry);
+  initializeScalarOpts(Registry);
+  //initializeObjCARCOpts(Registry);
+  initializeVectorization(Registry);
+  initializeIPO(Registry);
+  initializeAnalysis(Registry);
+  initializeIPA(Registry);
+  initializeTransformUtils(Registry);
+  initializeInstCombine(Registry);
+  //initializeInstrumentation(Registry);
+  initializeTarget(Registry);
+  // For codegen passes, only passes that do IR to IR transformation are
+  // supported.
+  initializeCodeGenPreparePass(Registry);
+  initializeAtomicExpandPass(Registry);
+  initializeRewriteSymbolsPass(Registry);
 
-	// Add the target data from the target machine, if it exists, or the module.
-	if (const DataLayout *DL = Target->getSubtargetImpl()->getDataLayout())
-		M->setDataLayout(DL);
-	PM.add(new DataLayoutPass());
+  if (!M) {
+    Err.print(argv[0], errs());
+    return 1;
+  }
 
+  // Create a PassManager to hold and optimize the collection of passes we are
+  // about to build.
+  //
+  PassManager Passes;
+
+  // Add an appropriate TargetLibraryInfo pass for the module's triple.
+  TargetLibraryInfo *TLI = new TargetLibraryInfo(Triple(M->getTargetTriple()));
+  Passes.add(TLI);
+
+  // Add an appropriate DataLayout instance for this module.
+  const DataLayout *DL = M->getDataLayout();
+  if (DL)
+    Passes.add(new DataLayoutPass());
+
+  Triple ModuleTriple(M->getTargetTriple());
+  TargetMachine *Machine = nullptr;
+  if (ModuleTriple.getArch())
+    Machine = GetTargetMachine(Triple(ModuleTriple));
+  std::unique_ptr<TargetMachine> TM(Machine);
+
+  // Add internal analysis passes from the target machine.
+  if (TM)
+    TM->addAnalysisPasses(Passes);
+
+  std::unique_ptr<FunctionPassManager> FPasses;
+  FPasses.reset(new FunctionPassManager(M.get()));
+  if (DL)
+	  FPasses->add(new DataLayoutPass());
+  if (TM)
+	  TM->addAnalysisPasses(*FPasses);
+
+  AddStandardLinkPasses(Passes);
+
+
+  AddOptimizationPasses(Passes, *FPasses, 3, 0);
+
+	FPasses->doInitialization();
+	for (Function &F : *M)
+	  FPasses->run(F);
+	FPasses->doFinalization();
+
+  // Check that the module is well formed on completion of optimization
+    Passes.add(createVerifierPass());
+    Passes.add(createDebugInfoVerifierPass());
+
+	// output code to stderr
+      Passes.add(createPrintModulePass(errs()));
+  // Now that we have all of the passes ready, run them.
+  Passes.run(*M);
+
+
+	//////// OUTPUT POST-OPT
+    Out.reset(new tool_output_file("vector_copy-opt.ll", EC, sys::fs::F_None));
+    if (EC) {
+      errs() << EC.message() << '\n';
+      return 1;
+    }
+	M->print(Out->os(), nullptr);
+	Out->keep();
+
+	// ${LLVM_PATH}/llc -O2 -march=hsail64 -filetype=obj -o ${FILE}.brig ${FILE}-opt.bc
+
+	PassManager* PM = new PassManager();
+
+    // Eliminate all unused functions
+    PM->add(createGlobalOptimizerPass());
+    PM->add(createStripDeadPrototypesPass());
+
+	// Inline all functions with always_inline attribute
+    PM->add(createAlwaysInlinerPass());
+
+    auto FPM = std::unique_ptr<FunctionPassManager>( new FunctionPassManager(nullptr /*M*/));
+
+    // Enqueue standard optimizations
+    PassManagerBuilder PMB;
+    PMB.OptLevel = CodeGenOpt::Aggressive;
+    PMB.populateFunctionPassManager(*FPM);
+
+	PM->add(new DataLayoutPass());
+
+	// OUTPUT ---------------------------------------------
+	std::string code;
 	SmallVector<char, 4096> ObjBufferSV;
+	//raw_string_ostream OS(code);
 	raw_svector_ostream OS(ObjBufferSV);
 	formatted_raw_ostream FOS(OS);
 
 	// Ask the target to add backend passes as necessary.
-	if (Target->addPassesToEmitFile(PM, FOS, TargetMachine::CGFT_ObjectFile, false,
+	if (TM->addPassesToEmitFile(*PM, FOS, TargetMachine::CGFT_ObjectFile, false,
 				nullptr, nullptr)) {
 		errs() << argv[0] << ": target does not support generation of this"
 			<< " file type!\n";
 		return 1;
 	}
 
-	PM.run(*Composite);
+	PM->run(*M);
 
 	FOS.flush();
 	OS.flush();
+
+//	errs() << OS.str();
+//
+//	return 0;
+	//////// OUTPUT BRIG
+    Out.reset(new tool_output_file("vector_copy.brig", EC, sys::fs::F_None));
+    if (EC) {
+      errs() << EC.message() << '\n';
+      return 1;
+    }
+	errs() << "Object Buffer Size: " << ObjBufferSV.size() << "\n";
+	Out->os().write(ObjBufferSV.data(), ObjBufferSV.size());
+	Out->os().flush();
+	Out->keep();
 
 	hsa_ext_module_t brig = (hsa_ext_module_t) ObjBufferSV.begin();
 
@@ -177,7 +393,10 @@ int main(int argc, char** argv) {
 
 #define check(msg, status) \
 	if (status != HSA_STATUS_SUCCESS) { \
-		printf("%s failed.\n", #msg); \
+		const char* _stat;\
+		hsa_status_string(status, &_stat);\
+		printf("%s failed.\n%s", #msg, _stat); \
+		\
 		exit(1); \
 	} else { \
 		printf("%s succeeded.\n", #msg); \
