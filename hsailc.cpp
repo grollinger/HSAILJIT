@@ -1,4 +1,6 @@
 #include "llvm/ADT/Triple.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/CommandFlags.h"
 #include "llvm/CodeGen/LinkAllAsmWriterComponents.h"
 #include "llvm/CodeGen/LinkAllCodegenComponents.h"
@@ -13,7 +15,6 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/Host.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/PluginLoader.h"
@@ -23,12 +24,12 @@
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
-#include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
 #include "llvm/Transforms/IPO.h"
 #include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #include <memory>
+#include "llvm/Support/raw_ostream.h"
 
 // Link
 #include "llvm/IR/DiagnosticInfo.h"
@@ -40,6 +41,14 @@
 #include "hsa_ext_finalize.h"
 
 using namespace llvm;
+
+namespace std {
+	template< class T, class... Args >
+	unique_ptr<T> make_unique( Args&&... args )
+	{
+		return unique_ptr<T>(new T(std::forward<Args>(args)...));
+	}
+}
 
 // Returns the TargetMachine instance or zero if no triple is provided.
 static TargetMachine* GetTargetMachine(Triple TheTriple) {
@@ -72,7 +81,7 @@ static inline void addPass(PassManagerBase &PM, Pass *P) {
   // If we are verifying all of the intermediate steps, add the verifier...
   if (false) {
     PM.add(createVerifierPass());
-    PM.add(createDebugInfoVerifierPass());
+    //PM.add(createDebugInfoVerifierPass());
   }
 }
 
@@ -83,7 +92,7 @@ static inline void addPass(PassManagerBase &PM, Pass *P) {
 static void AddOptimizationPasses(PassManagerBase &MPM,FunctionPassManager &FPM,
                                   unsigned OptLevel, unsigned SizeLevel) {
   FPM.add(createVerifierPass());          // Verify that input is correct
-  MPM.add(createDebugInfoVerifierPass()); // Verify that debug info is correct
+  //MPM.add(createDebugInfoVerifierPass()); // Verify that debug info is correct
 
   PassManagerBuilder Builder;
   Builder.OptLevel = OptLevel;
@@ -133,6 +142,35 @@ static void diagnosticHandler(const DiagnosticInfo &DI) {
   DiagnosticPrinterRawOStream DP(errs());
   DI.print(DP);
   errs() << '\n';
+}
+
+int load_module_from_file(const char* file_name, hsa_ext_module_t* module) {
+    int rc = -1;
+
+    FILE *fp = fopen(file_name, "rb");
+
+    rc = fseek(fp, 0, SEEK_END);
+
+    size_t file_size = (size_t) (ftell(fp) * sizeof(char));
+
+    rc = fseek(fp, 0, SEEK_SET);
+
+    char* buf = (char*) malloc(file_size);
+
+    memset(buf,0,file_size);
+
+    size_t read_size = fread(buf,sizeof(char),file_size,fp);
+
+    if(read_size != file_size) {
+        free(buf);
+    } else {
+        rc = 0;
+        *module = (hsa_ext_module_t) buf;
+    }
+
+    fclose(fp);
+
+    return rc;
 }
 
 void run_kernel(hsa_ext_module_t);
@@ -212,7 +250,7 @@ int main(int argc, char** argv) {
 	Out->keep();
 
 	// Link in the builtins
-	auto Composite = make_unique<Module>("llvm-link", Context);
+	auto Composite = std::make_unique<Module>("llvm-link", Context);
 	Composite->setDataLayout(M->getDataLayout());
 	Linker L(Composite.get(), diagnosticHandler);
 
@@ -275,13 +313,8 @@ int main(int argc, char** argv) {
   PassManager Passes;
 
   // Add an appropriate TargetLibraryInfo pass for the module's triple.
-  TargetLibraryInfo *TLI = new TargetLibraryInfo(Triple(M->getTargetTriple()));
+  auto TLI = new TargetLibraryInfoWrapperPass(Triple(M->getTargetTriple()));
   Passes.add(TLI);
-
-  // Add an appropriate DataLayout instance for this module.
-  const DataLayout *DL = M->getDataLayout();
-  if (DL)
-    Passes.add(new DataLayoutPass());
 
   Triple ModuleTriple(M->getTargetTriple());
   TargetMachine *Machine = nullptr;
@@ -290,15 +323,13 @@ int main(int argc, char** argv) {
   std::unique_ptr<TargetMachine> TM(Machine);
 
   // Add internal analysis passes from the target machine.
-  if (TM)
-    TM->addAnalysisPasses(Passes);
+  Passes.add(createTargetTransformInfoWrapperPass(TM ? TM->getTargetIRAnalysis()
+                                                     : TargetIRAnalysis()));
 
   std::unique_ptr<FunctionPassManager> FPasses;
   FPasses.reset(new FunctionPassManager(M.get()));
-  if (DL)
-	  FPasses->add(new DataLayoutPass());
-  if (TM)
-	  TM->addAnalysisPasses(*FPasses);
+  FPasses->add(createTargetTransformInfoWrapperPass(
+	TM ? TM->getTargetIRAnalysis() : TargetIRAnalysis()));
 
   AddStandardLinkPasses(Passes);
 
@@ -312,7 +343,7 @@ int main(int argc, char** argv) {
 
   // Check that the module is well formed on completion of optimization
     Passes.add(createVerifierPass());
-    Passes.add(createDebugInfoVerifierPass());
+    //Passes.add(createDebugInfoVerifierPass());
 
 	// output code to stderr
       Passes.add(createPrintModulePass(errs()));
@@ -347,17 +378,16 @@ int main(int argc, char** argv) {
     PMB.OptLevel = CodeGenOpt::Aggressive;
     PMB.populateFunctionPassManager(*FPM);
 
-	PM->add(new DataLayoutPass());
 
 	// OUTPUT ---------------------------------------------
-	std::string code;
 	SmallVector<char, 4096> ObjBufferSV;
-	//raw_string_ostream OS(code);
 	raw_svector_ostream OS(ObjBufferSV);
-	formatted_raw_ostream FOS(OS);
+
+	// Output format
+	auto FT = (0) ? TargetMachine::CGFT_AssemblyFile : TargetMachine::CGFT_ObjectFile;
 
 	// Ask the target to add backend passes as necessary.
-	if (TM->addPassesToEmitFile(*PM, FOS, TargetMachine::CGFT_ObjectFile, false,
+	if (TM->addPassesToEmitFile(*PM, OS, FT, false,
 				nullptr, nullptr)) {
 		errs() << argv[0] << ": target does not support generation of this"
 			<< " file type!\n";
@@ -366,24 +396,39 @@ int main(int argc, char** argv) {
 
 	PM->run(*M);
 
-	FOS.flush();
 	OS.flush();
 
-//	errs() << OS.str();
-//
-//	return 0;
-	//////// OUTPUT BRIG
-    Out.reset(new tool_output_file("vector_copy.brig", EC, sys::fs::F_None));
+
+	//////// OUTPUT
+    Out.reset(new tool_output_file(
+				(FT == TargetMachine::CGFT_AssemblyFile)
+				 ? "vector_copy.hsail"
+				 : "vector_copy.brig",
+				 EC, sys::fs::F_None));
     if (EC) {
       errs() << EC.message() << '\n';
       return 1;
     }
-	errs() << "Object Buffer Size: " << ObjBufferSV.size() << "\n";
 	Out->os().write(ObjBufferSV.data(), ObjBufferSV.size());
 	Out->os().flush();
 	Out->keep();
 
-	hsa_ext_module_t brig = (hsa_ext_module_t) ObjBufferSV.begin();
+	hsa_ext_module_t brig;
+
+	if(FT == TargetMachine::CGFT_AssemblyFile)
+	{
+		// HSAIL output
+		errs() << OS.str();
+		// Use brig file
+		load_module_from_file("vector_copy.brig", &brig);
+	}
+	else
+	{
+		// Continue with in-memory BRIG
+		brig = (hsa_ext_module_t) ObjBufferSV.data();
+	}
+
+
 
 	run_kernel(brig);
 
@@ -537,7 +582,7 @@ void run_kernel(hsa_ext_module_t module) {
 	 * Extract the symbol from the executable.
 	 */
 	hsa_executable_symbol_t symbol;
-	err = hsa_executable_get_symbol(executable, "", KERNEL_NAME.c_str(), agent, 0, &symbol);
+	err = hsa_executable_get_symbol(executable, NULL, KERNEL_NAME.c_str(), agent, 0, &symbol);
 	check(Extract the symbol from the executable, err);
 
 	/*
@@ -612,8 +657,6 @@ void run_kernel(hsa_ext_module_t module) {
 	const uint32_t queueMask = queue->size - 1;
 	hsa_kernel_dispatch_packet_t* dispatch_packet = &(((hsa_kernel_dispatch_packet_t*)(queue->base_address))[index&queueMask]);
 
-	dispatch_packet->header |= HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE;
-	dispatch_packet->header |= HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE;
 	dispatch_packet->setup  |= 1 << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
 	dispatch_packet->workgroup_size_x = (uint16_t)256;
 	dispatch_packet->workgroup_size_y = (uint16_t)1;
@@ -626,7 +669,13 @@ void run_kernel(hsa_ext_module_t module) {
 	dispatch_packet->kernarg_address = (void*) kernarg_address;
 	dispatch_packet->private_segment_size = private_segment_size;
 	dispatch_packet->group_segment_size = group_segment_size;
-	__atomic_store_n((uint8_t*)(&dispatch_packet->header), (uint8_t)HSA_PACKET_TYPE_KERNEL_DISPATCH, __ATOMIC_RELEASE);
+
+    uint16_t header = 0;
+    header |= HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE;
+    header |= HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE;
+    header |= HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE;
+
+	__atomic_store_n((uint16_t*)(&dispatch_packet->header), header, __ATOMIC_RELEASE);
 
 	/*
 	 * Increment the write index and ring the doorbell to dispatch the kernel.
@@ -639,7 +688,6 @@ void run_kernel(hsa_ext_module_t module) {
 	 * Wait on the dispatch completion signal until the kernel is finished.
 	 */
 	hsa_signal_value_t value = hsa_signal_wait_acquire(signal, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
-	printf("Signal returned: %li", value);
 
 	/*
 	 * Validate the data in the output buffer.
@@ -663,21 +711,24 @@ void run_kernel(hsa_ext_module_t module) {
 	/*
 	 * Cleanup all allocated resources.
 	 */
-	err=hsa_signal_destroy(signal);
-	check(Destroying the signal, err);
+    err = hsa_memory_free(kernarg_address);
+    check(Freeing kernel argument memory buffer, err);
 
-	err=hsa_executable_destroy(executable);
-	check(Destroying the executable, err);
+    err=hsa_signal_destroy(signal);
+    check(Destroying the signal, err);
 
-	err=hsa_code_object_destroy(code_object);
-	check(Destroying the code object, err);
+    err=hsa_executable_destroy(executable);
+    check(Destroying the executable, err);
 
-	err=hsa_queue_destroy(queue);
-	check(Destroying the queue, err);
+    err=hsa_code_object_destroy(code_object);
+    check(Destroying the code object, err);
 
-	err=hsa_shut_down();
-	check(Shutting down the runtime, err);
+    err=hsa_queue_destroy(queue);
+    check(Destroying the queue, err);
 
-	free(in);
-	free(out);
+    err=hsa_shut_down();
+    check(Shutting down the runtime, err);
+
+    free(in);
+    free(out);
 }
